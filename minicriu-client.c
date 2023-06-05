@@ -26,9 +26,11 @@
 
 #define _GNU_SOURCE
 
+#include <asm/prctl.h>
 #include <assert.h>
 #include <dirent.h>
 #include <errno.h>
+#include <elf.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/futex.h>
@@ -39,6 +41,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/procfs.h>
@@ -46,9 +49,6 @@
 #include <sys/types.h>
 #include <sys/syscall.h>      /* Definition of SYS_* constants */
 #include <unistd.h>
-
-#include <elf.h>
-#include <asm/prctl.h>
 
 #include "minicriu-client.h"
 
@@ -75,6 +75,7 @@ Elf64_Ehdr ehdr;
 Elf64_Phdr phdr[MC_MAX_PHDRS];
 Elf64_Nhdr nhdr[MC_MAX_THREADS];
 struct elf_prstatus prstatus[MC_MAX_THREADS];
+char thread_name[MC_MAX_THREADS][16];
 
 static pthread_mutex_t mc_getregs_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_barrier_t mc_thread_barrier;
@@ -92,6 +93,11 @@ static int mc_getmap();
 static int mc_cleanup();
 typedef void signal_handler(int);
 signal_handler *signal_wrapper = mc_sighnd;
+void *mc_discriminator = NULL;
+void *mc_vdso_addr, *mc_vvar_addr;
+size_t mc_vdso_size, mc_vvar_size;
+// yes this is absolutely hacky and limited, let's rework the format
+char mc_fdbuffer[4096];
 
 struct savedctx {
 	unsigned long fsbase, gsbase;
@@ -154,6 +160,25 @@ static unsigned long align_up(unsigned long v, unsigned p) {
 
 static char mc_dump_path[PATH_MAX];
 
+#define WRITE_PADDING(len) \
+	if (len % MC_NOTE_PADDING != 0) { \
+		int padding = align_up(bytesWritten, MC_NOTE_PADDING) - bytesWritten; \
+		fwrite(paddingData, padding, 1, coreFile); \
+		bytesWritten += padding; \
+		notes_size += padding; \
+	}
+
+static int readfdlink(int fd, char *link, size_t len) {
+  char fdpath[64];
+  snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", fd);
+  int ret = readlink(fdpath, link, len);
+  if (ret == -1) {
+    return ret;
+  }
+  link[(unsigned)ret < len ? ret : len - 1] = '\0';
+  return ret;
+}
+
 static int mc_save_core_file() {
 
 	pid_t pid = syscall(SYS_getpid);
@@ -193,7 +218,7 @@ static int mc_save_core_file() {
 		return 1;
 	}
 
-	struct  nt_note {
+    struct nt_note {
 		long count;
 		long page_size;
 		long descsz;
@@ -230,7 +255,10 @@ static int mc_save_core_file() {
 		}
 
 		// [vsyscall] is mapped to the same address in each process
-		if (!strncmp(buffer + name_start, "[vsyscall]", sizeof("[vsyscall]") - 1)) {
+		// [vvar] and [vdso] are not dumpable at all
+		if (!strncmp(buffer + name_start, "[vsyscall]", sizeof("[vsyscall]") - 1) ||
+			!strncmp(buffer + name_start, "[vdso]", sizeof("[vdso]") - 1) ||
+			!strncmp(buffer + name_start, "[vvar]", sizeof("[vvar]") - 1)) {
 			continue;
 		}
 
@@ -260,6 +288,25 @@ static int mc_save_core_file() {
 	}
 
 	fclose(proc_maps);
+
+	char path[PATH_MAX];
+	struct dirent *dp;
+
+	int fdbufferlen = 0;
+	DIR *dir = opendir("/proc/self/fd");
+	while ((dp = readdir(dir)) && fdbufferlen < sizeof(mc_fdbuffer)) {
+		int fd = atoi(dp->d_name);
+		if (fd > 2 && fd != dirfd(dir)) {
+			int r = readfdlink(fd, path, sizeof(path));
+			if (r > 0) {
+				fdbufferlen += 1 + snprintf(mc_fdbuffer + fdbufferlen, sizeof(mc_fdbuffer) - fdbufferlen, "%d%c%s", fd, '\0', path);
+			}
+		}
+	}
+	closedir(dir);
+	if (fdbufferlen < sizeof(mc_fdbuffer)) {
+		mc_fdbuffer[fdbufferlen] = '\0';
+	}
 
 	// Updating headers
 	ehdr.e_phnum = phnum;
@@ -291,7 +338,7 @@ static int mc_save_core_file() {
 
 	char owner[] = "CORE"; // "CORE" gives more information while reading using readelf and eu-readelf tools
 	char paddingData[0x1000];
-	memset(paddingData, 0x0, 0x1000);
+	memset(paddingData, 0, sizeof(paddingData));
 	int thread_counter = mc_thread_counter;
 
 	// Write PRSTATUS data for every process thread
@@ -374,7 +421,14 @@ static int mc_save_core_file() {
 				fwrite(paddingData, padding % sizeof(paddingData), 1, coreFile);
 			}
 
-			int written = fwrite((void *)phdr[i].p_vaddr, 1, phdr[i].p_filesz, coreFile);
+			int written = 0;
+			if ((void *) phdr[i].p_vaddr == mc_discriminator) {
+				size_t len = strlen("RESTORE") + 1;
+				written = fwrite("RESTORE", 1, len, coreFile);
+				written += fwrite((void *) (phdr[i].p_vaddr + len), 1, phdr[i].p_filesz - len, coreFile);
+			} else {
+				written = fwrite((void *)phdr[i].p_vaddr, 1, phdr[i].p_filesz, coreFile);
+			}
 
 			if (written != phdr[i].p_filesz) {
 			    // This happens when the mapping is larger than the mapped file (rounded up to page size)
@@ -453,6 +507,10 @@ static void mc_make_core(int sig, siginfo_t *info, void *ctx) {
 	pthread_barrier_wait(&mc_thread_barrier);
 }
 
+bool minicriu_is_restore() {
+	return memcmp(mc_discriminator, "RESTORE", strlen("RESTORE")) == 0;
+}
+
 static inline bool mc_is_internal_signal(int signum) {
 	// GLIBC uses signals 32 and 33 internally and manipulation causes EINVAL
 	return signum == SIGKILL || signum == SIGSTOP || (signum > SIGSYS && signum < SIGRTMIN);
@@ -481,6 +539,93 @@ static bool mc_check_signal_blocked(const char *taskid) {
 	}
 	fclose(status);
 	return false;
+}
+
+static void mc_remap(const char *name, void *from_addr, size_t from_size, void *to_addr, size_t to_size) {
+	void *new_addr = NULL;
+	if (from_addr == NULL) {
+		fprintf(stderr, "Can't remap %s\n", name);
+	} else if (from_size != to_size) {
+		fprintf(stderr, "%s sizes don't match: %lu vs. %lu\n", name, from_size, to_size);
+		exit(1);
+	} else if (from_addr == to_addr)  {
+		// no need to remap
+	} else if ((new_addr = mremap(from_addr, from_size, to_size, MREMAP_FIXED | MREMAP_MAYMOVE, to_addr)) == MAP_FAILED) {
+		fprintf(stderr, "Failed to remap %s %p->%p: %s\n", name, from_addr, to_addr, strerror(errno));
+		exit(1);
+	}
+}
+
+static bool mc_restore_vdso_vvar() {
+    FILE *proc_maps = fopen("/proc/self/maps", "r");
+	if (proc_maps == NULL) {
+		printf("Could not open maps file..\n");
+		return false;
+	}
+
+	void *new_vdso_addr = NULL, *new_vvar_addr = NULL;
+	size_t new_vdso_size, new_vvar_size;
+	char buffer[256];
+	while (fgets(buffer, sizeof(buffer), proc_maps)) {
+		void *addr_start, *addr_end;
+		char perms[8];
+		long ofs;
+		int name_start = 0;
+		int name_end = 0;
+
+		int res = sscanf(buffer, "%p-%p %7s %lx %*d:%*d %*x %n%*[^\n]%n", &addr_start,
+		 	&addr_end, perms, &ofs, &name_start, &name_end);
+
+		if (res < 4) {
+		 	perror("sscanf");
+		 	fclose(proc_maps);
+		 	return false;
+		}
+
+		if (!strncmp(buffer + name_start, "[vdso]", sizeof("[vdso]") - 1)) {
+			new_vdso_addr = addr_start;
+			new_vdso_size = addr_end - addr_start;
+		} else if (!strncmp(buffer + name_start, "[vvar]", sizeof("[vvar]") - 1)) {
+			new_vvar_addr = addr_start;
+			new_vvar_size = addr_end - addr_start;
+		}
+	}
+	fclose(proc_maps);
+
+	// TODO: handle if the mappings are in conflict (e.g. old vdso = new vvar
+	assert(new_vdso_addr + new_vdso_size <= mc_vvar_addr || new_vdso_addr >= mc_vvar_addr + mc_vvar_size);
+	assert(new_vvar_addr + new_vvar_size <= mc_vdso_addr || new_vvar_addr >= mc_vdso_addr + mc_vdso_size);
+	mc_remap("[vdso]", new_vdso_addr, new_vdso_size, mc_vdso_addr, mc_vdso_size);
+	mc_remap("[vvar]", new_vvar_addr, new_vvar_size, mc_vvar_addr, mc_vvar_size);
+
+	return true;
+}
+
+static void mc_restore_file_descriptors() {
+	const char *data = mc_fdbuffer;
+	const char *end = mc_fdbuffer + sizeof(mc_fdbuffer);
+	while (data < end && *data != '\0') {
+		int fd = atoi(data);
+		if (fd <= 2) {
+			fprintf(stderr, "Unexpected FD %d\n", fd);
+			exit(1);
+		}
+		data = data + strlen(data) + 1;
+		// who cares about modes and offsets now...
+		int newfd = open(data, O_RDONLY | O_CLOEXEC);
+		if (newfd < 0) {
+			fprintf(stderr, "Can't open FD %d = %s\n", fd, data);
+			perror("Cannot open file");
+			exit(1);
+		} else if (newfd != fd) {
+			if (dup3(newfd, fd, O_CLOEXEC) != fd) {
+				perror("ddup3");
+				exit(1);
+			}
+			close(newfd);
+		}
+		data = data + strlen(data) + 1;
+	}
 }
 
 int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_handler **handler_ptr) {
@@ -554,7 +699,6 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 			continue;
 		}
 		int tid = atoi(taskdent->d_name);
-		debug_log("minicriu %d me %d\n", tid, mytid == tid);
 		if (tid == mytid) {
 			continue;
 		}
@@ -582,6 +726,15 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 	// Say to other threads that barrier is initialized
 	__atomic_fetch_add(&mc_barrier_initialization, 1, __ATOMIC_SEQ_CST);
 	syscall(SYS_futex, &mc_barrier_initialization, FUTEX_WAKE, thread_counter);
+
+	// Allocate one page that will have a different contents after restore
+	mc_discriminator = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
+	if (mc_discriminator == MAP_FAILED) {
+		perror("mmap restore discriminator");
+	} else {
+		memcpy(mc_discriminator, "CHECKPOINT", 10);
+	}
+
     if (mc_getmap())
 		printf("failed to get maps from /proc/self/maps\n");
 
@@ -591,12 +744,21 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 	pthread_mutex_lock(&mc_getregs_mutex);
 	int extra_arg = mc_gregs_counter++;
 	pthread_mutex_unlock(&mc_getregs_mutex);
+
+	if (prctl(PR_GET_NAME, thread_name[extra_arg]) != 0) {
+		perror("Can't read thread name\n");
+	}
+
 	int r = syscall(SYS_tkill, syscall(SYS_gettid), MC_GET_REGISTERS, extra_arg);
 
 	RESTORE_CTX(ctx);
 
 	int newtid = syscall(SYS_gettid);
 	*gettid_ptr(pthread_self()) = newtid;
+
+	if (prctl(PR_SET_NAME, thread_name[extra_arg]) != 0) {
+		perror("Can't update thread name\n");
+	}
 
 	for (int i = 1; i < SIGRTMAX; ++i) {
 		if (mc_is_internal_signal(i)) continue;
@@ -611,6 +773,10 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 		return 1;
 	}
 
+	mc_restore_vdso_vvar();
+	mc_restore_file_descriptors();
+
+    // This requires CAP_SYS_RESOURCE
 	if ((0 < auxvlen) && (prctl(PR_SET_MM, PR_SET_MM_AUXV, auxv, auxvlen, 0) < 0)) {
 		perror("prctl auxv");
 	}
@@ -666,7 +832,6 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 
 	mc_futex_restore = 1;
 	syscall(SYS_futex, &mc_futex_restore, FUTEX_WAKE, INT_MAX);
-	fprintf(stderr, "WAKE UP %d\n", mc_futex_restore);
 
 	/*
 	*	Here we synchronize the threads so that we do not
@@ -736,6 +901,14 @@ static void mc_sighnd(int sig) {
 	pthread_mutex_lock(&mc_getregs_mutex);
 	int extra_arg = mc_gregs_counter++;
 	pthread_mutex_unlock(&mc_getregs_mutex);
+
+    if (prctl(PR_GET_NAME, thread_name[extra_arg]) != 0) {
+		perror("Can't read thread name\n");
+	}
+	struct robust_list_head *robust_list_head;
+	size_t robust_list_length;
+	syscall(SYS_get_robust_list, tid, &robust_list_head, &robust_list_length);
+
 	int r = syscall(SYS_tkill, syscall(SYS_gettid), MC_GET_REGISTERS, extra_arg);
 
 
@@ -761,7 +934,22 @@ static void mc_sighnd(int sig) {
 	RESTORE_CTX(ctx);
 
 	int newtid = syscall(SYS_gettid);
-	*gettid_ptr(pthread_self()) = newtid;
+	pid_t *tid_ptr = gettid_ptr(pthread_self());
+	pid_t oldtid = *tid_ptr;
+	*tid_ptr = newtid;
+
+	// without this pthread_join would get broken
+	if (!syscall(SYS_set_tid_address, tid_ptr)) {
+		perror("Cannot set TID address");
+	}
+
+	if (prctl(PR_SET_NAME, thread_name[extra_arg]) != 0) {
+		perror("Can't set thread name");
+	}
+
+	if (syscall(SYS_set_robust_list, robust_list_head, robust_list_length)) {
+		perror("Cannot set robust list");
+	}
 
 	if (pthread_sigmask(SIG_SETMASK, &old_sigmask, NULL)) {
 		perror("Cannot restore thread sigmask");
@@ -771,12 +959,10 @@ static void mc_sighnd(int sig) {
 	while (thread_loop);
 }
 
-bool minicriu_is_restore() {
-	return false; // TODO: implement me
-}
-
 void minicriu_finalize_checkpoint() {
-	// TODO: implement me
+	if (munmap(mc_discriminator, 4096)) {
+		perror("munmap discriminator");
+	}
 }
 
 static int mc_getmap() {
@@ -805,6 +991,14 @@ static int mc_getmap() {
 		* maps to the same address in the kernel space
 		*/
 		if (!strncmp(mapname, "[vsyscall]", 10)) continue;
+		// We need to record VDSO and VVAR, too, otherwise we would unmap them!
+		if (!strncmp(mapname, "[vdso]", sizeof("[vdso]") - 1)) {
+			mc_vdso_addr = addr_start;
+			mc_vdso_size = addr_end - addr_start;
+		} else if (!strncmp(mapname, "[vvar]", sizeof("[vvar]") - 1)) {
+			mc_vvar_addr = addr_start;
+			mc_vvar_size = addr_end - addr_start;
+		}
 
 		if (mc_mapscnt == MC_MAX_MAPS) {
 			fclose(proc_maps);
@@ -836,7 +1030,6 @@ static int mc_cleanup() {
 			perror("maps sscanf");
 			return 1;
 		}
-
 		// location of [vsyscall] page is fixed in the kernel ABI
 		if (!strncmp(mapname, "[vsyscall]", 10)) continue;
 		last_map_start = addr_start;
@@ -852,5 +1045,5 @@ static int mc_cleanup() {
 	if(maps[mc_mapscnt - 1].start < last_map_start) {
 		munmap(maps[mc_mapscnt - 1].end, last_map_end - maps[mc_mapscnt - 1].end);
 	}
-	return 0;
+    return 0;
 }

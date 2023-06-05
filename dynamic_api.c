@@ -123,18 +123,17 @@ int restore(const char* const* args, restore_handler *on_restore) {
 		fprintf(stderr, "minicriu: No restore source core dump!\n");
 		return -1;
 	}
-	const char *source = args[i - 1];
-	char path[PATH_MAX];
+	const char *image = args[i - 1];
 
 	struct stat st;
-	if (stat(source, &st) != 0) {
+	if (stat(image, &st) != 0) {
 		perror("minicriu: failed to stat restore path");
 		return -1;
 	}
 	if (st.st_mode & S_IFDIR) {
-		snprintf(path, PATH_MAX, "%s/minicriu-core", source);
+		return minicriu_restore(image, on_restore);
 	} else {
-		snprintf(path, PATH_MAX, "%s", source);
+		fprintf(stderr, "Restore path (%s) should be a directory\n", image);
+		return -1;
 	}
-	return minicriu_restore(path, on_restore);
 }

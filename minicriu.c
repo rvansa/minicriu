@@ -28,6 +28,8 @@
 
 #include <assert.h>
 #include <alloca.h>
+#include <dirent.h>
+#include <errno.h>
 #include <limits.h>
 #include <string.h>
 #include <stdint.h>
@@ -47,6 +49,7 @@
 #include <sys/syscall.h>      /* Definition of SYS_* constants */
 #include <linux/sched.h>
 #include <linux/elf.h>
+#include <linux/limits.h>
 
 
 static struct elf_prpsinfo *prpsinfo;
@@ -74,7 +77,7 @@ static void restore_action(int sig, siginfo_t *info, void *ctx) {
 	ucontext_t *uc = (ucontext_t *) ctx;
 
 	greg_t *gregs = uc->uc_mcontext.gregs;
-	int thread_id = gregs[REG_RDX];
+	int thread_id = info->si_value.sival_int;
 	struct user_regs_struct *uregs = (void*)prstatus[thread_id]->pr_reg;
 
 	/*printf("restore %d fsbase %llx\n", thread_id, uregs->fs_base);*/
@@ -135,8 +138,11 @@ static unsigned long align_up(unsigned long v, unsigned p) {
 }
 
 static int clonefn(void *arg) {
-	int r = syscall(SYS_tkill, syscall(SYS_gettid), SIGSYS,
-                       /* extra arg to _signal handler_ */ arg);
+	siginfo_t info;
+	info.si_signo = SIGSYS;
+	info.si_code = SI_QUEUE;
+	info.si_value.sival_ptr = arg;
+	int r = syscall(SYS_rt_tgsigqueueinfo, syscall(SYS_getpid), syscall(SYS_gettid), SIGSYS, &info);
 	fprintf(stderr, "should not reach here (thread %d)\n", (int)(long)arg);
 	return 1;
 }
@@ -149,10 +155,17 @@ int minicriu_restore(const char *dir, restore_handler *on_restore) {
 
 	int fd = open(elfpath, O_RDONLY);
 	if (fd < 0) {
-		perror("open minicriu dump");
-		fprintf(stderr, "Cannot open %s\n", elfpath);
+		fprintf(stderr, "Cannot open %s: %s\n", elfpath, strerror(errno));
 		return 1;
 	}
+	// hack: avoid conflicts with previously open files
+	int oldfd = fd;
+	fd = dup2(fd, 1000);
+	if (fd < 0) {
+		perror("dup2");
+		return 1;
+	}
+	close(oldfd);
 
 	struct stat st;
 	if (fstat(fd, &st)) {
@@ -281,7 +294,6 @@ int minicriu_restore(const char *dir, restore_handler *on_restore) {
 		}
 	}
 
-
 	for (int i = 0; i < ehdr->e_phnum; ++i) {
 		const Elf64_Phdr *ph = phdrs + i;
 		if (ph->p_type != PT_LOAD) {
@@ -309,7 +321,34 @@ int minicriu_restore(const char *dir, restore_handler *on_restore) {
 
 	pthread_barrier_init(&thread_barrier, NULL, thread_n);
 
-	for (int i = 1; i < thread_n; ++i) {
+    // We need to kill or reuse any existing threads rather than creating new ones
+	// TODO: it would be better to map the primordinal thread in the old process
+	// to the new one, otherwise the process could be reported as a zombie only
+    // because the primordinal thread died. Just sorting tasks by PID might be enough.
+	pid_t mypid = getpid();
+	pid_t mytid = gettid();
+	int i = 1;
+	DIR *tasksdir = opendir("/proc/self/task/");
+	struct dirent *taskdent;
+	while (i < thread_n && (taskdent = readdir(tasksdir))) {
+		if (taskdent->d_name[0] == '.') {
+			continue;
+		}
+		int tid = atoi(taskdent->d_name);
+		if (tid == mytid) {
+			continue;
+		}
+		siginfo_t info;
+		info.si_signo = SIGSYS;
+		info.si_code = SI_QUEUE;
+		info.si_value.sival_int = i,
+		syscall(SYS_rt_tgsigqueueinfo, mypid, tid, SIGSYS, &info);
+		++i;
+	}
+	closedir(tasksdir);
+	// TODO: what happens if the process has more threads than the restored one?
+
+	for (; i < thread_n; ++i) {
 		const int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SYSVSEM
                            | CLONE_SIGHAND | CLONE_THREAD;
                            /*| CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID*/
