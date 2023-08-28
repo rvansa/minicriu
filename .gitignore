@@ -4,3 +4,4 @@
 /file
 /libshared.so
 *.[aod]
+/minicriu-core.*

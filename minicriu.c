@@ -51,6 +51,7 @@
 #include <linux/elf.h>
 #include <limits.h>
 
+#include "mc-shared.h"
 
 #define MAX_THREADS 128
 #define MAX_FILEMAPS 1024
@@ -415,7 +416,9 @@ int main(int argc, char *argv[]) {
 #endif
 	}
 
-	// TODO: auxv info is now in the core dump, restore it if we have the CAP_SYS_RESOURCE permission
+	// Had we kept the rseq registration that happens automatically for the primordial thread
+	// the attempt to re-register it after restore would fail with EINVAL.
+	mc_unregister_rseq(pthread_self());
 
 	clonefn((void*)(uintptr_t)0);
 	fprintf(stderr, "should not reach here\n");

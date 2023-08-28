@@ -50,6 +50,7 @@
 #include <sys/syscall.h> /* Definition of SYS_* constants */
 #include <unistd.h>
 
+#include "mc-shared.h"
 #include "minicriu-client.h"
 
 // Signal sent to all threads but the checkpointing one
@@ -631,6 +632,8 @@ int minicriu_dump(void) {
 	if (mc_getmap())
 		printf("failed to get maps from /proc/self/maps\n");
 
+	mc_unregister_rseq(pthread_self());
+
 	pid_t pid = syscall(SYS_getpid);
 
 	// Save registers
@@ -643,6 +646,8 @@ int minicriu_dump(void) {
 
 	int newtid = syscall(SYS_gettid);
 	*gettid_ptr(pthread_self()) = newtid;
+
+    mc_reregister_rseq(pthread_self());
 
 	for (int i = 1; i < SIGRTMAX; ++i) {
 		if (mc_is_internal_signal(i)) continue;
@@ -741,6 +746,9 @@ static void mc_checkpoint_thread(int sig) {
 
 	assert(*gettid_ptr(pthread_self()) == tid);
 
+    // Unregister rseq
+    mc_unregister_rseq(pthread_self());
+
 	// Make sure that barrier was initialized
 	uint32_t current_count;
 	while ((current_count = mc_barrier_initialization) == 0) {
@@ -787,6 +795,8 @@ static void mc_checkpoint_thread(int sig) {
 
 	int newtid = syscall(SYS_gettid);
 	*gettid_ptr(pthread_self()) = newtid;
+
+	mc_reregister_rseq(pthread_self());
 
 	if (pthread_sigmask(SIG_SETMASK, &old_sigmask, NULL)) {
 		perror("Cannot restore thread sigmask");
