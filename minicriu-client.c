@@ -52,7 +52,9 @@
 
 #include "minicriu-client.h"
 
+// Signal sent to all threads but the checkpointing one
 #define MC_THREAD_SIG SIGSYS
+// Registers are checkpointed on all threads
 #define MC_GET_REGISTERS SIGUSR1
 #define MC_MAX_MAPS 512
 #define MC_MAX_PHDRS 512
@@ -451,6 +453,36 @@ static void mc_make_core(int sig, siginfo_t *info, void *ctx) {
 	pthread_barrier_wait(&mc_thread_barrier);
 }
 
+static inline bool mc_is_internal_signal(int signum) {
+	// GLIBC uses signals 32 and 33 internally and manipulation causes EINVAL
+	return signum == SIGKILL || signum == SIGSTOP || (signum > SIGSYS && signum < SIGRTMIN);
+}
+
+// It is not possible to change signal mask for another thread, so in the unlikely
+// case that the thread blocks MC_THREAD_SIG we must give up on checkpoint.
+// In the past this was unblocked by minicriu_register_new_thread but there's no
+// guarantee that the thread wouldn't block the signal at any later point: therefore
+// we'll just make it a requirement from the application side.
+static bool mc_check_signal_blocked(const char *taskid) {
+	char buf[256];
+	snprintf(buf, sizeof(buf), "/proc/self/task/%s", taskid);
+	FILE *status = fopen(buf, "r");
+	char line[256];
+	while (fgets(line, sizeof(line), status)) {
+		if (!strncmp(line, "SigBlk:", 7)) {
+			unsigned long long bits = strtoull(line + 7, NULL, 16);
+			if (bits & (1 << (MC_THREAD_SIG - 1))) {
+				fprintf(stderr, "Thread LWP %s is blocking signal %d, cannot perform checkpoint.\n", taskid, MC_THREAD_SIG);
+				fclose(status);
+				return true;
+			}
+			break; // ignore rest
+		}
+	}
+	fclose(status);
+	return false;
+}
+
 int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_handler **handler_ptr) {
 	snprintf(mc_dump_path, sizeof(mc_dump_path), "%s", path);
 
@@ -485,16 +517,32 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 		.sa_flags = SA_SIGINFO
 	};
 
-	struct sigaction oldhnd1;
-	struct sigaction oldhnd2;
+	struct sigaction sigactions[SIGRTMAX];
+	for (int i = 1; i < SIGRTMAX; ++i) {
+		if (mc_is_internal_signal(i)) continue;
+		if (sigaction(i, NULL, &sigactions[i])) {
+			perror("Cannot save signal handler");
+			return 1;
+		}
+	}
 
-	if (sigaction(MC_THREAD_SIG, &newhnd1, &oldhnd1)) {
+	if (sigaction(MC_THREAD_SIG, &newhnd1, NULL)) {
 		perror("sigaction");
 		return 1;
 	}
 
-	if (sigaction(MC_GET_REGISTERS, &newhnd2, &oldhnd2)) {
+	if (sigaction(MC_GET_REGISTERS, &newhnd2, NULL)) {
 		perror("sigaction");
+		return 1;
+	}
+
+	sigset_t sigset, oldset;
+	if (sigemptyset(&sigset) || sigaddset(&sigset, MC_GET_REGISTERS)) {
+		perror("Cannot set signal mask");
+		return 1;
+	}
+	if (pthread_sigmask(SIG_UNBLOCK, &sigset, &oldset)) {
+		perror("Cannot unblock signals");
 		return 1;
 	}
 
@@ -510,9 +558,9 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 		if (tid == mytid) {
 			continue;
 		}
-		if (tid == mypid) {
-			/* don't touch premodorial thread */
-			continue;
+		if (mc_check_signal_blocked(taskdent->d_name)) {
+			closedir(tasksdir);
+			return 1;
 		}
 		int r = syscall(SYS_tkill, tid, MC_THREAD_SIG);
 		__atomic_fetch_sub(&mc_futex_checkpoint, 1, __ATOMIC_SEQ_CST);
@@ -537,8 +585,6 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
     if (mc_getmap())
 		printf("failed to get maps from /proc/self/maps\n");
 
-    // TODO: save signal handlers
-
 	pid_t pid = syscall(SYS_getpid);
 
 	// Save registers
@@ -552,13 +598,16 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 	int newtid = syscall(SYS_gettid);
 	*gettid_ptr(pthread_self()) = newtid;
 
-	if (sigaction(MC_THREAD_SIG, &oldhnd1, NULL)) {
-		perror("sigaction");
-		return 1;
+	for (int i = 1; i < SIGRTMAX; ++i) {
+		if (mc_is_internal_signal(i)) continue;
+		if (sigaction(i, &sigactions[i], NULL)) {
+			perror("Cannot restore signal handler");
+			return 1;
+		}
 	}
 
-	if (sigaction(MC_GET_REGISTERS, &oldhnd2, NULL)) {
-		perror("sigaction");
+	if (pthread_sigmask(SIG_SETMASK, &oldset, NULL)) {
+		perror("sigprocmask UNBLOCK");
 		return 1;
 	}
 
@@ -617,6 +666,7 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 
 	mc_futex_restore = 1;
 	syscall(SYS_futex, &mc_futex_restore, FUTEX_WAKE, INT_MAX);
+	fprintf(stderr, "WAKE UP %d\n", mc_futex_restore);
 
 	/*
 	*	Here we synchronize the threads so that we do not
@@ -659,7 +709,7 @@ static void mc_sighnd(int sig) {
 
 	pthread_t self = pthread_self();
 	pid_t *tidptr = gettid_ptr(self);
-	pthread_kill(self, 0);
+	pthread_kill(self, 0); // noop, just error checking
 
 	debug_log("%s: self %ld tidptr %p *tidptr %d\n",
 		__func__, self, tidptr, *tidptr);
@@ -670,6 +720,16 @@ static void mc_sighnd(int sig) {
 	uint32_t current_count;
 	while ((current_count = mc_barrier_initialization) == 0) {
 		syscall(SYS_futex, &mc_barrier_initialization, FUTEX_WAIT, current_count);
+	}
+
+	// Note: if signal MC_THREAD_SIG is blocked, we won't get here, and we don't
+	// have chance to perform the checkpoint.
+	sigset_t sigmask, old_sigmask;
+	if (sigemptyset(&sigmask) || sigaddset(&sigmask, MC_GET_REGISTERS)) {
+		perror("Cannot construct thread sigmask");
+	}
+	if (pthread_sigmask(SIG_UNBLOCK, &sigmask, &old_sigmask)) {
+		perror("Cannot get thread sigmask");
 	}
 
 	// Save registers
@@ -703,21 +763,12 @@ static void mc_sighnd(int sig) {
 	int newtid = syscall(SYS_gettid);
 	*gettid_ptr(pthread_self()) = newtid;
 
-	volatile int thread_loop = 0;
-	while (thread_loop);
-}
-
-int minicriu_register_new_thread(void) {
-
-	sigset_t set;
-	sigemptyset(&set);
-	sigaddset(&set, MC_THREAD_SIG);
-	if (pthread_sigmask(SIG_UNBLOCK, &set, NULL)) {
-		perror("sigprocmask UNBLOCK");
-		return 1;
+	if (pthread_sigmask(SIG_SETMASK, &old_sigmask, NULL)) {
+		perror("Cannot restore thread sigmask");
 	}
 
-	return 0;
+	volatile int thread_loop = 0;
+	while (thread_loop);
 }
 
 bool minicriu_is_restore() {
