@@ -77,9 +77,7 @@ Elf64_Nhdr nhdr[MC_MAX_THREADS];
 struct elf_prstatus prstatus[MC_MAX_THREADS];
 char thread_name[MC_MAX_THREADS][16];
 
-static pthread_mutex_t mc_getregs_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_barrier_t mc_thread_barrier;
-static volatile int mc_gregs_counter;
 static volatile int mc_thread_counter;
 
 static volatile uint32_t mc_futex_checkpoint;
@@ -88,10 +86,10 @@ static volatile uint32_t mc_restored_threads;
 int mc_mapscnt;
 static volatile uint32_t mc_barrier_initialization;
 
-static void mc_sighnd(int sig);
+static void mc_sighnd(int sig, siginfo_t *info, void *ctx);
 static int mc_getmap();
 static int mc_cleanup();
-typedef void signal_handler(int);
+typedef void signal_handler(int, siginfo_t *, void *);
 signal_handler *signal_wrapper = mc_sighnd;
 void *mc_discriminator = NULL;
 void *mc_vdso_addr, *mc_vvar_addr;
@@ -177,6 +175,17 @@ static int readfdlink(int fd, char *link, size_t len) {
   }
   link[(unsigned)ret < len ? ret : len - 1] = '\0';
   return ret;
+}
+
+static int mc_signal_thread(int signum, int tid, int arg) {
+	siginfo_t info;
+	info.si_signo = signum;
+	info.si_code = SI_QUEUE;
+	info.si_value.sival_int = arg;
+	if (syscall(SYS_rt_tgsigqueueinfo, syscall(SYS_getpid), tid, signum, &info)) {
+		fprintf(stderr, "Cannot send signal %d (value %d) to thread %d: %s\n",
+			signum, arg, tid, strerror(errno));
+	}
 }
 
 static int mc_save_core_file() {
@@ -471,7 +480,7 @@ static int mc_save_core_file() {
 static void mc_make_core(int sig, siginfo_t *info, void *ctx) {
 	ucontext_t *uc = (ucontext_t *)ctx;
 	greg_t *gregs = uc->uc_mcontext.gregs;
-	int thread_id = gregs[REG_RDX]; // get extra argument
+	int thread_id = info->si_value.sival_int;
 
 	struct user_regs_struct *uregs = (void *)prstatus[thread_id].pr_reg;
 	uregs->r15 = gregs[REG_R15];
@@ -499,7 +508,8 @@ static void mc_make_core(int sig, siginfo_t *info, void *ctx) {
 
 	// Wait until all threads save their registers
 	pthread_barrier_wait(&mc_thread_barrier);
-	if (thread_id == mc_thread_counter - 1) {
+	// It doesn't matter which thread writes the core file
+	if (thread_id == 0) {
 		mc_save_core_file();
 	}
 
@@ -656,7 +666,10 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 	struct savedctx ctx;
 	SAVE_CTX(ctx);
 
-	struct sigaction newhnd1 = { .sa_handler = signal_wrapper };
+	struct sigaction newhnd1 = {
+		.sa_sigaction = signal_wrapper,
+		.sa_flags = SA_SIGINFO
+	};
 	struct sigaction newhnd2 = {
 		.sa_sigaction = mc_make_core,
 		.sa_flags = SA_SIGINFO
@@ -691,7 +704,8 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 		return 1;
 	}
 
-	int thread_counter = 0;
+	mc_thread_counter = 0;
+	int my_thread_id = -1;
 	DIR *tasksdir = opendir("/proc/self/task/");
 	struct dirent *taskdent;
 	while ((taskdent = readdir(tasksdir))) {
@@ -700,20 +714,21 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 		}
 		int tid = atoi(taskdent->d_name);
 		if (tid == mytid) {
+			my_thread_id = mc_thread_counter++;
 			continue;
 		}
 		if (mc_check_signal_blocked(taskdent->d_name)) {
 			closedir(tasksdir);
+			// TODO: revert all signals etc
 			return 1;
 		}
-		int r = syscall(SYS_tkill, tid, MC_THREAD_SIG);
+		int r = mc_signal_thread(MC_THREAD_SIG, tid, mc_thread_counter++);
 		__atomic_fetch_sub(&mc_futex_checkpoint, 1, __ATOMIC_SEQ_CST);
-		thread_counter++;
 	}
 	closedir(tasksdir);
 
-	mc_thread_counter = thread_counter + 1;
-	debug_log("thread_counter = %d\n", thread_counter);
+	assert(my_thread_id >= 0);
+	debug_log("thread_counter = %d\n", mc_thread_counter);
 
 	uint32_t current_count;
 	while ((current_count = mc_futex_checkpoint) != 0) {
@@ -725,7 +740,7 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 
 	// Say to other threads that barrier is initialized
 	__atomic_fetch_add(&mc_barrier_initialization, 1, __ATOMIC_SEQ_CST);
-	syscall(SYS_futex, &mc_barrier_initialization, FUTEX_WAKE, thread_counter);
+	syscall(SYS_futex, &mc_barrier_initialization, FUTEX_WAKE, INT_MAX);
 
 	// Allocate one page that will have a different contents after restore
 	mc_discriminator = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
@@ -740,23 +755,19 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 
 	pid_t pid = syscall(SYS_getpid);
 
-	// Save registers
-	pthread_mutex_lock(&mc_getregs_mutex);
-	int extra_arg = mc_gregs_counter++;
-	pthread_mutex_unlock(&mc_getregs_mutex);
-
-	if (prctl(PR_GET_NAME, thread_name[extra_arg]) != 0) {
+	if (prctl(PR_GET_NAME, thread_name[my_thread_id]) != 0) {
 		perror("Can't read thread name\n");
 	}
 
-	int r = syscall(SYS_tkill, syscall(SYS_gettid), MC_GET_REGISTERS, extra_arg);
+	// Save registers
+	mc_signal_thread(MC_GET_REGISTERS, syscall(SYS_gettid), my_thread_id);
 
 	RESTORE_CTX(ctx);
 
 	int newtid = syscall(SYS_gettid);
 	*gettid_ptr(pthread_self()) = newtid;
 
-	if (prctl(PR_SET_NAME, thread_name[extra_arg]) != 0) {
+	if (prctl(PR_SET_NAME, thread_name[my_thread_id]) != 0) {
 		perror("Can't update thread name\n");
 	}
 
@@ -838,7 +849,7 @@ int minicriu_dump_internal(const char *path, signal_handler *wrapper, signal_han
 	*	munmap segments before the threads are restored
 	*/
 
-	while ((current_count = mc_restored_threads) != thread_counter) {
+	while ((current_count = mc_restored_threads) != mc_thread_counter - 1) {
 		syscall(SYS_futex, &mc_restored_threads, FUTEX_WAIT, current_count);
 	}
 
@@ -862,8 +873,8 @@ int minicriu_dump() {
 	minicriu_dump_internal(path, NULL, NULL);
 }
 
-static void mc_sighnd(int sig) {
-
+static void mc_sighnd(int sig, siginfo_t *info, void *ctx_unused) {
+	int thread_id = info->si_value.sival_int;
 	__atomic_fetch_add(&mc_futex_checkpoint, 1, __ATOMIC_SEQ_CST);
 	syscall(SYS_futex, &mc_futex_checkpoint, FUTEX_WAKE, 1);
 
@@ -897,19 +908,15 @@ static void mc_sighnd(int sig) {
 		perror("Cannot get thread sigmask");
 	}
 
-	// Save registers
-	pthread_mutex_lock(&mc_getregs_mutex);
-	int extra_arg = mc_gregs_counter++;
-	pthread_mutex_unlock(&mc_getregs_mutex);
-
-    if (prctl(PR_GET_NAME, thread_name[extra_arg]) != 0) {
+    if (prctl(PR_GET_NAME, thread_name[thread_id]) != 0) {
 		perror("Can't read thread name\n");
 	}
 	struct robust_list_head *robust_list_head;
 	size_t robust_list_length;
 	syscall(SYS_get_robust_list, tid, &robust_list_head, &robust_list_length);
 
-	int r = syscall(SYS_tkill, syscall(SYS_gettid), MC_GET_REGISTERS, extra_arg);
+	// Save registers
+	mc_signal_thread(MC_GET_REGISTERS, syscall(SYS_gettid), thread_id);
 
 
 	while (!mc_futex_restore) {
@@ -943,7 +950,7 @@ static void mc_sighnd(int sig) {
 		perror("Cannot set TID address");
 	}
 
-	if (prctl(PR_SET_NAME, thread_name[extra_arg]) != 0) {
+	if (prctl(PR_SET_NAME, thread_name[thread_id]) != 0) {
 		perror("Can't set thread name");
 	}
 

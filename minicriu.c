@@ -327,7 +327,8 @@ int minicriu_restore(const char *dir, restore_handler *on_restore) {
     // because the primordinal thread died. Just sorting tasks by PID might be enough.
 	pid_t mypid = getpid();
 	pid_t mytid = gettid();
-	int i = 1;
+	int i = 0;
+	int my_thread_id = -1;
 	DIR *tasksdir = opendir("/proc/self/task/");
 	struct dirent *taskdent;
 	while (i < thread_n && (taskdent = readdir(tasksdir))) {
@@ -336,6 +337,7 @@ int minicriu_restore(const char *dir, restore_handler *on_restore) {
 		}
 		int tid = atoi(taskdent->d_name);
 		if (tid == mytid) {
+			my_thread_id = i++;
 			continue;
 		}
 		siginfo_t info;
@@ -379,7 +381,7 @@ int minicriu_restore(const char *dir, restore_handler *on_restore) {
 		on_restore();
 	}
 
-	clonefn((void*)(uintptr_t)0);
+	clonefn((void*)(uintptr_t) my_thread_id);
 	fprintf(stderr, "should not reach here\n");
 	return 0;
 }
