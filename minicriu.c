@@ -78,8 +78,13 @@ static void restore_action(int sig, siginfo_t *info, void *ctx) {
 
 	greg_t *gregs = uc->uc_mcontext.gregs;
 	int thread_id = info->si_value.sival_int;
-	struct user_regs_struct *uregs = (void*)prstatus[thread_id]->pr_reg;
 
+	if (thread_id >= thread_n) {
+		syscall(SYS_exit, 0);
+		perror("Failed to stop thread");
+	}
+
+	struct user_regs_struct *uregs = (void*)prstatus[thread_id]->pr_reg;
 	/*printf("restore %d fsbase %llx\n", thread_id, uregs->fs_base);*/
 
 	gregs[REG_R15] = uregs->r15;
@@ -331,7 +336,7 @@ int minicriu_restore(const char *dir, restore_handler *on_restore) {
 	int my_thread_id = -1;
 	DIR *tasksdir = opendir("/proc/self/task/");
 	struct dirent *taskdent;
-	while (i < thread_n && (taskdent = readdir(tasksdir))) {
+	while (taskdent = readdir(tasksdir)) {
 		if (taskdent->d_name[0] == '.') {
 			continue;
 		}
@@ -343,9 +348,8 @@ int minicriu_restore(const char *dir, restore_handler *on_restore) {
 		siginfo_t info;
 		info.si_signo = SIGSYS;
 		info.si_code = SI_QUEUE;
-		info.si_value.sival_int = i,
+		info.si_value.sival_int = i++,
 		syscall(SYS_rt_tgsigqueueinfo, mypid, tid, SIGSYS, &info);
-		++i;
 	}
 	closedir(tasksdir);
 	// TODO: what happens if the process has more threads than the restored one?
