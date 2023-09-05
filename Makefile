@@ -33,8 +33,9 @@ minicriu : LDFLAGS += -static
 minicriu.o : CFLAGS += -fPIE
 
 minicriu-client.o : CFLAGS += -fPIC
+core-writer.o: CFLAGS += -fPIC
 
-libminicriu-client.a : minicriu-client.o
+libminicriu-client.a : minicriu-client.o core-writer.o
 	ar rcs $@ $^
 
 test : test.o libminicriu-client.a libshared.so

@@ -51,6 +51,7 @@
 #include <unistd.h>
 
 #include "minicriu-client.h"
+#include "core-writer.h"
 
 // Signal sent to all threads but the checkpointing one
 #define MC_CHECKPOINT_THREAD SIGSYS
@@ -60,7 +61,6 @@
 #define MC_MAX_PHDRS 512
 #define MC_MAX_THREADS 64
 #define MC_OWNER_SIZE 5
-#define MC_NOTE_PADDING 4
 
 #define CORE_NOTE_HEADER_SIZE (sizeof(Elf64_Nhdr) + align_up(MC_OWNER_SIZE, MC_NOTE_PADDING))
 
@@ -73,7 +73,6 @@
 	#define debug_log
 #endif
 
-Elf64_Ehdr ehdr;
 Elf64_Phdr phdr[MC_MAX_PHDRS];
 struct elf_prstatus prstatus[MC_MAX_THREADS];
 
@@ -166,10 +165,6 @@ static ssize_t writefile(const char *file, const char *buf, size_t len) {
 	return bytes;
 }
 
-static unsigned long align_up(unsigned long v, unsigned p) {
-	return (v + p - 1) & ~(p - 1);
-}
-
 static void mc_prepare_prpsinfo(struct elf_prpsinfo *info) {
 	memset(info, 0, sizeof(struct elf_prpsinfo));
 	info->pr_sname = 'R';
@@ -190,105 +185,19 @@ static void mc_prepare_prpsinfo(struct elf_prpsinfo *info) {
 	}
 }
 
-typedef struct {
-	FILE *file;
-	size_t bytes_written;
-} core_writer;
-
-static int core_write_padding(core_writer *w, size_t bytes) {
-	char paddingData[0x1000];
-	memset(paddingData, 0, sizeof(paddingData));
-	while (bytes > 0) {
-		size_t max = bytes > sizeof(paddingData) ? sizeof(paddingData) : bytes;
-		int written = fwrite(paddingData, 1, max, w->file);
-		if (written == 0) {
-			fprintf(stderr, "Cannot write padding: %m\n");
-			return 1;
-		}
-		w->bytes_written += written;
-		bytes -= written;
-	}
-	return 0;
-}
-
-static int core_write(core_writer *w, const void *data, size_t bytes) {
-	size_t written = fwrite(data, 1, bytes, w->file);
-	if (written != bytes) {
-		fprintf(stderr, "Written too few bytes (%ld/%ld): %m", written, bytes);
-		// FIXME
-		exit(1);
-	}
-	w->bytes_written += bytes;
-	return 0;
-}
-
-static int core_write_note_prologue(core_writer *w, Elf64_Word type, size_t bytes) {
-	char owner[] = "CORE"; // "CORE" gives more information while reading using readelf and eu-readelf tools
-
-	Elf64_Nhdr nhdr;
-	nhdr.n_type = type;
-	nhdr.n_namesz = sizeof(owner);
-	nhdr.n_descsz = bytes;
-	core_write(w, &nhdr, sizeof(Elf64_Nhdr));
-	core_write(w, owner, sizeof(owner));
-
-	if (nhdr.n_namesz % MC_NOTE_PADDING != 0) {
-		int padding = align_up(w->bytes_written, MC_NOTE_PADDING) - w->bytes_written;
-		core_write_padding(w, padding);
-	}
-}
-
-static int core_write_note_epilogue(core_writer *w, size_t bytes) {
-	if (bytes % MC_NOTE_PADDING != 0) {
-		int padding = align_up(w->bytes_written, MC_NOTE_PADDING) - w->bytes_written;
-		core_write_padding(w, padding);
-	}
-}
-
-static int core_write_note(core_writer *w, Elf64_Word type, const void *data, size_t bytes) {
-	core_write_note_prologue(w, type, bytes);
-	core_write(w, data, bytes);
-	core_write_note_epilogue(w, bytes);
-	return 0;
-}
-
 static int mc_save_core_file() {
 
 	pid_t pid = syscall(SYS_getpid);
-	int phnum = 0;
-
-	// Create Elf header
-	memset(&ehdr, 0, sizeof(ehdr));
-	memcpy(ehdr.e_ident, ELFMAG, SELFMAG);
-	ehdr.e_ident[EI_CLASS] = ELFCLASS64;
-	#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-	ehdr.e_ident[EI_DATA] = ELFDATA2LSB;
-	#else
-	ehdr.e_ident[EI_DATA] = ELFDATA2MSB;
-	#endif
-	ehdr.e_ident[EI_VERSION] = EV_CURRENT;
-	ehdr.e_ident[EI_OSABI] = ELFOSABI_SYSV;
-	ehdr.e_type = ET_CORE;
-	ehdr.e_machine = EM_X86_64;
-	ehdr.e_version = EV_CURRENT;
-	ehdr.e_phoff = sizeof(Elf64_Ehdr);
-	ehdr.e_ehsize = sizeof(Elf64_Ehdr);
-	ehdr.e_phentsize = sizeof(Elf64_Phdr);
 
 	// Create PT_NOTE phdr
-	phdr[phnum].p_type = PT_NOTE;
-	phdr[phnum].p_flags = 0;
-	phdr[phnum].p_offset = 0;
-	phdr[phnum].p_vaddr = 0;
-	phdr[phnum].p_paddr = 0;
-	phdr[phnum].p_memsz = 0;
-	phdr[phnum].p_filesz = 0;
-	phdr[phnum++].p_align = 0;
+	memset(&phdr[0], 0, sizeof(Elf64_Phdr));
+	phdr[0].p_type = PT_NOTE;
+	int phnum = 1;
 
 	FILE *proc_maps = fopen("/proc/self/maps", "r");
 	if (proc_maps == NULL) {
 		perror("Could not open maps file. Failed to create checkpoint.");
-		return 1;
+		return -1;
 	}
 
 	struct nt_note {
@@ -324,7 +233,7 @@ static int mc_save_core_file() {
 		if (res < 4) {
 			perror("sscanf. Failed to create checkpoint.");
 			fclose(proc_maps);
-			return 1;
+			return -1;
 		}
 
 		// [vsyscall] is mapped to the same address in each process
@@ -370,66 +279,56 @@ static int mc_save_core_file() {
 		fprintf(stderr, "read auxv: %s\n", strerror(auxvlen));
 	}
 
-	// Updating headers
-	ehdr.e_phnum = phnum;
 	int prpsinfo_sz = CORE_NOTE_HEADER_SIZE + sizeof(struct elf_prpsinfo);
 	int auxv_sz = CORE_NOTE_HEADER_SIZE + align_up(auxvlen, MC_NOTE_PADDING);
 	int prstatus_sz = mc_thread_counter * (CORE_NOTE_HEADER_SIZE + sizeof(struct elf_prstatus));
 	int ntfile_sz = CORE_NOTE_HEADER_SIZE + align_up(nt_file.descsz, MC_NOTE_PADDING);
 	phdr[0].p_filesz = prpsinfo_sz + auxv_sz + prstatus_sz + ntfile_sz;
-	phdr[0].p_offset = sizeof(Elf64_Ehdr) + ehdr.e_phnum * ehdr.e_phentsize;
+	phdr[0].p_offset = sizeof(Elf64_Ehdr) + phnum * sizeof(Elf64_Phdr);
 	for (int i = 1; i < phnum; i++) {
 		phdr[i].p_offset = align_up(phdr[i - 1].p_offset + phdr[i - 1].p_filesz, phdr[i].p_align);
 	}
 
 	char filename[32];
 	sprintf(filename, "minicriu-core.%d", pid);
-	core_writer w = {
-		.file = fopen(filename, "w+"),
-		.bytes_written = 0,
-	};
-	if (w.file == NULL) {
-		perror("Could not create file for minicriu dump. Failed to create checkpoint.");
-		return 1;
-	}
-
-	// Write elf header
-	core_write(&w, &ehdr, sizeof(Elf64_Ehdr));
-	// Write phdrs
-	core_write(&w, phdr, sizeof(Elf64_Phdr) * phnum);
+	core_writer w __attribute__((cleanup (core_writer_close)));
+	MUST(core_writer_open(&w, filename));
+	MUST(core_write_header(&w, phdr, phnum));
 
 	struct elf_prpsinfo prpsinfo;
 	mc_prepare_prpsinfo(&prpsinfo);
-	core_write_note(&w, NT_PRPSINFO, &prpsinfo, sizeof(prpsinfo));
+	MUST(core_write_note(&w, NT_PRPSINFO, &prpsinfo, sizeof(prpsinfo)));
 
-	core_write_note(&w, NT_AUXV, &auxv, auxvlen);
+	MUST(core_write_note(&w, NT_AUXV, &auxv, auxvlen));
 
 	int thread_counter = mc_thread_counter;
 	// Write PRSTATUS data for every process thread
 	for (int i = 0; i < thread_counter; i++) {
-		core_write_note(&w, NT_PRSTATUS, &prstatus[i], sizeof(struct elf_prstatus));
+		MUST(core_write_note(&w, NT_PRSTATUS, &prstatus[i], sizeof(struct elf_prstatus)));
 	}
 
 	// Write NT_FILE
-	core_write_note_prologue(&w, NT_FILE, nt_file.descsz);
-	core_write(&w, &nt_file, sizeof(nt_file.count) + sizeof(nt_file.page_size));
-	core_write(&w, &nt_file.filemaps, sizeof(struct filemap) * nt_file.count);
+	MUST(core_write_note_prologue(&w, NT_FILE, nt_file.descsz));
+	MUST(core_write(&w, &nt_file, sizeof(nt_file.count) + sizeof(nt_file.page_size)));
+	MUST(core_write(&w, &nt_file.filemaps, sizeof(struct filemap) * nt_file.count));
 	for (int i = 0; i < nt_file.count; i++) {
 		if (fputs(nt_file.filepath[i], w.file) == EOF) {
 			perror("fputs");
+			return -1;
 		}
 		if (fputc('\0', w.file) == EOF) {
 			perror("putc");
+			return -1;
 		}
 		w.bytes_written += strlen(nt_file.filepath[i]) + 1;
 	}
-	core_write_note_epilogue(&w, nt_file.descsz);
+	MUST(core_write_note_epilogue(&w, nt_file.descsz));
 
 	// Write PT_LOAD
 	for (int i = 1; i < phnum; i++) {
 		if (phdr[i].p_filesz != 0) {
 			int padding = phdr[i].p_offset - (phdr[i - 1].p_offset + phdr[i - 1].p_filesz);
-			core_write_padding(&w, padding);
+			MUST(core_write_padding(&w, padding));
 
 			int written = fwrite((void *)phdr[i].p_vaddr, 1, phdr[i].p_filesz, w.file);
 			w.bytes_written += written;
@@ -443,12 +342,11 @@ static int mc_save_core_file() {
 				}
 
 				// We fill the unwritten data with zeros
-				core_write_padding(&w, phdr[i].p_filesz - written);
+				MUST(core_write_padding(&w, phdr[i].p_filesz - written));
 			}
 		}
 	}
 
-	fclose(w.file);
 	return 0;
 }
 
