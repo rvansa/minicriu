@@ -28,6 +28,7 @@
 
 #include <assert.h>
 #include <alloca.h>
+#include <elf.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <string.h>
@@ -49,17 +50,18 @@
 #include <asm/prctl.h>		/* Definition of ARCH_* constants */
 #include <sys/syscall.h>	  /* Definition of SYS_* constants */
 #include <linux/sched.h>
-#include <linux/elf.h>
 #include <limits.h>
 
+#include "list.h"
 
-#define MAX_THREADS 128
-#define MAX_FILEMAPS 1024
+typedef struct {
+	struct elf_prstatus prstatus;
+	// TODO: this is not restored!
+	struct user_fpregs_struct fpregs;
+} thread_info_t;
 
-static int thread_n;
-static struct elf_prstatus *prstatus[MAX_THREADS];
-static struct user_fpregs_struct *prfpreg[MAX_THREADS];
-static char stack[MAX_THREADS][4 * 4096];
+DECLARE_LIST(thread_info_t);
+thread_info_t_list thread_info;
 
 static pthread_barrier_t thread_barrier;
 
@@ -74,13 +76,13 @@ static void arch_prctl(int code, unsigned long addr) {
 	}
 }
 
-static int mc_signal_thread(int signum, int tid, int arg) {
+static int mc_signal_thread(int signum, int tid, void *arg) {
 	siginfo_t info;
 	info.si_signo = signum;
 	info.si_code = SI_QUEUE;
-	info.si_value.sival_int = arg;
+	info.si_value.sival_ptr = arg;
 	if (syscall(SYS_rt_tgsigqueueinfo, syscall(SYS_getpid), tid, signum, &info)) {
-		fprintf(stderr, "Cannot send signal %d (value %d) to thread %d: %s\n",
+		fprintf(stderr, "Cannot send signal %d (value %p) to thread %d: %s\n",
 			signum, arg, tid, strerror(errno));
 	}
 }
@@ -89,8 +91,8 @@ static void restore(int sig, siginfo_t *info, void *ctx) {
 	ucontext_t *uc = (ucontext_t *) ctx;
 
 	greg_t *gregs = uc->uc_mcontext.gregs;
-	int thread_id = info->si_value.sival_int;
-	struct user_regs_struct *uregs = (void*)prstatus[thread_id]->pr_reg;
+	thread_info_t *thread_info = (thread_info_t *) info->si_value.sival_ptr;
+	struct user_regs_struct *uregs = (void*) thread_info->prstatus.pr_reg;
 
 	/*printf("restore %d fsbase %llx\n", thread_id, uregs->fs_base);*/
 
@@ -150,8 +152,8 @@ static unsigned long align_up(unsigned long v, unsigned p) {
 }
 
 static int clonefn(void *arg) {
-	mc_signal_thread(SIGSYS, syscall(SYS_gettid), (int)(uintptr_t) arg);
-	fprintf(stderr, "should not reach here (thread %ld)\n", (uintptr_t) arg);
+	mc_signal_thread(SIGSYS, syscall(SYS_gettid), arg);
+	fprintf(stderr, "should not reach here (thread info %p)\n", arg);
 	return 1;
 }
 
@@ -195,13 +197,20 @@ static bool has_resource_cap() {
 
 // what does this really do?
 static void visit_note(off_t nameoff, off_t doff, const Elf64_Nhdr *nh) {
-	void *target = NULL;
+	thread_info_t *last_thread = NULL;
 	if (!strcmp("CORE", rawelf + nameoff)) {
 		switch (nh->n_type) {
 		// We ignore PRPSINFO (if present): the values might be truncated anyway
 		// so we cannot rely on this for restore.
-		case NT_PRSTATUS: target = &prstatus[thread_n++]; break;
-		case NT_PRFPREG:  target = &prfpreg[thread_n];  break;
+		case NT_PRSTATUS: {
+			last_thread = APPEND_LIST(thread_info_t, &thread_info);
+			last_thread->prstatus = *((prstatus_t *) (rawelf + doff));
+			break;
+		}
+		case NT_PRFPREG: {
+			last_thread->fpregs = *((struct user_fpregs_struct *) (rawelf + doff));
+			break;
+		}
 		case NT_AUXV:
 			if (has_resource_cap() && prctl(PR_SET_MM, PR_SET_MM_AUXV, rawelf + doff, nh->n_descsz, 0)) {
 				perror("Cannot set auxiliary vector");
@@ -214,9 +223,6 @@ static void visit_note(off_t nameoff, off_t doff, const Elf64_Nhdr *nh) {
 		case NT_X86_XSTATE: break;
 		default: break;
 		}
-	}
-	if (target) {
-		*(void**)target = rawelf + doff;
 	}
 }
 
@@ -373,7 +379,7 @@ int main(int argc, char *argv[]) {
 				perror("Failed to read in memory");
 				return 1;
 			} else if (read == 0) {
-				fprintf(stderr, "Cannot read data for %llx (section %d/%d, offset %llx) (EOF): read %lu/%llu bytes\n",
+				fprintf(stderr, "Cannot read data for %lx (section %d/%d, offset %lx) (EOF): read %lu/%lu bytes\n",
 					ph->p_vaddr, i, ehdr->e_phnum, ph->p_offset + total, total, ph->p_filesz);
 				return 1;
 			}
@@ -397,38 +403,27 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
-	pthread_barrier_init(&thread_barrier, NULL, thread_n);
+	pthread_barrier_init(&thread_barrier, NULL, thread_info.size);
 
-	for (int i = 1; i < thread_n; ++i) {
+	FOREACH(thread_info_t, &thread_info) {
+		if (prev == NULL) {
+			continue;
+		}
+		size_t stack_size = 4 * 4096;
+		void *stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+		if (stack == MAP_FAILED) {
+			perror("mmap stack");
+			return -1;
+		}
 		const int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SYSVSEM
 			| CLONE_SIGHAND | CLONE_THREAD;
 			/*| CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID*/
-#if 0
-		static_assert(sizeof(stack[i]) == 4 * 4096);
-		struct clone_args args = {
-			.flags = flags,
-			.stack = (unsigned long)stack[i],
-			.stack_size = sizeof(stack[i]),
-		};
-		memset(stack[i], 0xaa, sizeof(stack[i]));
-		int ret = syscall(SYS_clone3, &args, sizeof(args), 0xaaaaaaaaaaaaa, 0xbbbbbbbbbbb);
-		if (ret == -1) {
-			perror("clone3");
-		} else if (!ret) {
-			volatile register long thread_id asm("rax") = i;
-			raise(SIGUSR1);
-			fprintf(stderr, "should not reach here\n");
-		}
-#else
-		if (-1 == clone(clonefn, stack[i] + sizeof(stack[i]), flags, (void*)(uintptr_t)i)) {
+		if (-1 == clone(clonefn, stack + stack_size, flags, &item->value)) {
 			perror("clone");
 		}
-#endif
 	}
 
-	// TODO: auxv info is now in the core dump, restore it if we have the CAP_SYS_RESOURCE permission
-
-	clonefn((void*)(uintptr_t)0);
+	clonefn(&thread_info.first->value);
 	fprintf(stderr, "should not reach here\n");
 	return 0;
 }

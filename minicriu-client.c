@@ -52,6 +52,7 @@
 
 #include "minicriu-client.h"
 #include "core-writer.h"
+#include "list.h"
 
 // Signal sent to all threads but the checkpointing one
 #define MC_CHECKPOINT_THREAD SIGSYS
@@ -73,16 +74,16 @@
 	#define debug_log
 #endif
 
-Elf64_Phdr phdr[MC_MAX_PHDRS];
-struct elf_prstatus prstatus[MC_MAX_THREADS];
+DECLARE_LIST(Elf64_Phdr);
+typedef struct elf_prstatus prstatus_t;
+DECLARE_LIST(prstatus_t);
+prstatus_t_list mc_prstatus;
 
 static pthread_barrier_t mc_thread_barrier;
-static volatile int mc_thread_counter;
 
 static volatile uint32_t mc_futex_checkpoint;
 static volatile uint32_t mc_futex_restore;
 static volatile uint32_t mc_restored_threads;
-int mc_mapscnt;
 static volatile uint32_t mc_barrier_initialization;
 
 static void mc_checkpoint_thread(int sig, siginfo_t *info, void *ctx);
@@ -93,10 +94,12 @@ struct savedctx {
 	unsigned long fsbase, gsbase;
 };
 
-struct mc_map {
+typedef struct {
 	void *start;
 	void *end;
-} maps[MC_MAX_MAPS];
+} mc_map;
+DECLARE_LIST(mc_map);
+mc_map_list mc_maps;
 
 #define SAVE_CTX(ctx) do { \
 	asm volatile("rdfsbase %0" : "=r" (ctx.fsbase) : : "memory"); \
@@ -163,13 +166,13 @@ static ssize_t writefile(const char *file, const char *buf, size_t len) {
 	return bytes;
 }
 
-static int mc_signal_thread(int signum, int tid, int arg) {
+static int mc_signal_thread(int signum, int tid, void *arg) {
 	siginfo_t info;
 	info.si_signo = signum;
 	info.si_code = SI_QUEUE;
-	info.si_value.sival_int = arg;
+	info.si_value.sival_ptr = arg;
 	if (syscall(SYS_rt_tgsigqueueinfo, syscall(SYS_getpid), tid, signum, &info)) {
-		fprintf(stderr, "Cannot send signal %d (value %d) to thread %d: %s\n",
+		fprintf(stderr, "Cannot send signal %d (value %p) to thread %d: %s\n",
 			signum, arg, tid, strerror(errno));
 	}
 }
@@ -195,13 +198,9 @@ static void mc_prepare_prpsinfo(struct elf_prpsinfo *info) {
 }
 
 static int mc_save_core_file() {
-
 	pid_t pid = syscall(SYS_getpid);
-
-	// Create PT_NOTE phdr
-	memset(&phdr[0], 0, sizeof(Elf64_Phdr));
-	phdr[0].p_type = PT_NOTE;
-	int phnum = 1;
+	Elf64_Phdr_list phdr __attribute__((cleanup (Elf64_Phdr_list_destroy)));
+	INIT_LIST(Elf64_Phdr, &phdr);
 
 	FILE *proc_maps = fopen("/proc/self/maps", "r");
 	if (proc_maps == NULL) {
@@ -262,22 +261,24 @@ static int mc_save_core_file() {
 			nt_file.count++;
 		}
 
-		phdr[phnum].p_type = PT_LOAD;
-		phdr[phnum].p_flags = 0;
-		phdr[phnum].p_flags |= perms[0] == 'r' ? PF_R : 0;
-		phdr[phnum].p_flags |= perms[1] == 'w' ? PF_W : 0;
-		phdr[phnum].p_flags |= perms[2] == 'x' ? PF_X : 0;
-		phdr[phnum].p_offset = 0;
-		phdr[phnum].p_vaddr = (long unsigned int)addr_start;
-		phdr[phnum].p_paddr = 0;
-		phdr[phnum].p_memsz = addr_end - addr_start;
+		Elf64_Phdr *load = APPEND_LIST(Elf64_Phdr, &phdr);
+		load->p_type = PT_LOAD;
+		load->p_flags = 0;
+		load->p_flags |= perms[0] == 'r' ? PF_R : 0;
+		load->p_flags |= perms[1] == 'w' ? PF_W : 0;
+		load->p_flags |= perms[2] == 'x' ? PF_X : 0;
+		load->p_offset = 0;
+		load->p_vaddr = (long unsigned int)addr_start;
+		load->p_paddr = 0;
+		load->p_memsz = addr_end - addr_start;
 		// TODO: We should check if the mapped memory equals the file contents
 		// and in that case make filesz 0.
 		// Even if the mapping is non-readable we should check if it's all-zeroes
 		// and exclude contents only if that's so: application might have temporarily
 		// non-accessible parts of memory whose protection will eventually change.
-		phdr[phnum].p_filesz = phdr[phnum].p_flags != 0 ? addr_end - addr_start : 0;
-		phdr[phnum++].p_align = 0x1000;
+		load->p_filesz = load->p_flags != 0 ? addr_end - addr_start : 0;
+		load->p_align = 0x1000;
+
 	}
 
 	fclose(proc_maps);
@@ -288,21 +289,30 @@ static int mc_save_core_file() {
 		fprintf(stderr, "read auxv: %s\n", strerror(auxvlen));
 	}
 
+	Elf64_Phdr *note = PREPEND_LIST(Elf64_Phdr, &phdr);
+	memset(note, 0, sizeof(note));
+	note->p_type = PT_NOTE;
+
 	int prpsinfo_sz = CORE_NOTE_HEADER_SIZE + sizeof(struct elf_prpsinfo);
 	int auxv_sz = CORE_NOTE_HEADER_SIZE + align_up(auxvlen, MC_NOTE_PADDING);
-	int prstatus_sz = mc_thread_counter * (CORE_NOTE_HEADER_SIZE + sizeof(struct elf_prstatus));
+	int prstatus_sz = mc_prstatus.size * (CORE_NOTE_HEADER_SIZE + sizeof(struct elf_prstatus));
 	int ntfile_sz = CORE_NOTE_HEADER_SIZE + align_up(nt_file.descsz, MC_NOTE_PADDING);
-	phdr[0].p_filesz = prpsinfo_sz + auxv_sz + prstatus_sz + ntfile_sz;
-	phdr[0].p_offset = sizeof(Elf64_Ehdr) + phnum * sizeof(Elf64_Phdr);
-	for (int i = 1; i < phnum; i++) {
-		phdr[i].p_offset = align_up(phdr[i - 1].p_offset + phdr[i - 1].p_filesz, phdr[i].p_align);
+	note->p_filesz = prpsinfo_sz + auxv_sz + prstatus_sz + ntfile_sz;
+	note->p_offset = sizeof(Elf64_Ehdr) + phdr.size * sizeof(Elf64_Phdr);
+	FOREACH(Elf64_Phdr, &phdr) {
+		if (prev != NULL) {
+			item->value.p_offset = align_up(prev->value.p_offset + prev->value.p_filesz, item->value.p_align);
+		}
 	}
 
 	char filename[32];
 	sprintf(filename, "minicriu-core.%d", pid);
 	core_writer w __attribute__((cleanup (core_writer_close)));
 	MUST(core_writer_open(&w, filename));
-	MUST(core_write_header(&w, phdr, phnum));
+	MUST(core_write_elf_header(&w, phdr.size));
+	FOREACH(Elf64_Phdr, &phdr) {
+		MUST(core_write(&w, &item->value, sizeof(item->value)));
+	}
 
 	struct elf_prpsinfo prpsinfo;
 	mc_prepare_prpsinfo(&prpsinfo);
@@ -310,11 +320,12 @@ static int mc_save_core_file() {
 
 	MUST(core_write_note(&w, NT_AUXV, &auxv, auxvlen));
 
-	int thread_counter = mc_thread_counter;
+	int thread_counter = mc_prstatus.size;
 	// Write PRSTATUS data for every process thread
-	for (int i = 0; i < thread_counter; i++) {
-		MUST(core_write_note(&w, NT_PRSTATUS, &prstatus[i], sizeof(struct elf_prstatus)));
+	FOREACH(prstatus_t, &mc_prstatus) {
+		MUST(core_write_note(&w, NT_PRSTATUS, &item->value, sizeof(struct elf_prstatus)));
 	}
+	DESTROY_LIST(prstatus_t, &mc_prstatus);
 
 	// Write NT_FILE
 	MUST(core_write_note_prologue(&w, NT_FILE, nt_file.descsz));
@@ -334,15 +345,20 @@ static int mc_save_core_file() {
 	MUST(core_write_note_epilogue(&w, nt_file.descsz));
 
 	// Write PT_LOAD
-	for (int i = 1; i < phnum; i++) {
-		if (phdr[i].p_filesz != 0) {
-			int padding = phdr[i].p_offset - (phdr[i - 1].p_offset + phdr[i - 1].p_filesz);
+	Elf64_Phdr_list_item *prev = NULL;
+	FOREACH(Elf64_Phdr, &phdr) {
+		if (prev == NULL) {
+			continue;
+		}
+		Elf64_Phdr *load = &item->value;
+		if (load->p_filesz != 0) {
+			int padding = load->p_offset - (prev->value.p_offset + prev->value.p_filesz);
 			MUST(core_write_padding(&w, padding));
 
-			int written = fwrite((void *)phdr[i].p_vaddr, 1, phdr[i].p_filesz, w.file);
+			int written = fwrite((void *)load->p_vaddr, 1, load->p_filesz, w.file);
 			w.bytes_written += written;
 
-			if (written != phdr[i].p_filesz) {
+			if (written != load->p_filesz) {
 				// This happens when the mapping is larger than the mapped file (rounded up to page size)
 				// - errno is EFAULT. Accessing that memory directly would result in SIGBUS.
 				if (errno != EFAULT) {
@@ -351,7 +367,7 @@ static int mc_save_core_file() {
 				}
 
 				// We fill the unwritten data with zeros
-				MUST(core_write_padding(&w, phdr[i].p_filesz - written));
+				MUST(core_write_padding(&w, load->p_filesz - written));
 			}
 		}
 	}
@@ -362,9 +378,9 @@ static int mc_save_core_file() {
 static void mc_persist_registers(int sig, siginfo_t *info, void *ctx) {
 	ucontext_t *uc = (ucontext_t *)ctx;
 	greg_t *gregs = uc->uc_mcontext.gregs;
-	int thread_id = info->si_value.sival_int;
+	prstatus_t *thread_prstatus = (prstatus_t *) info->si_value.sival_ptr;
 
-	struct user_regs_struct *uregs = (void *)prstatus[thread_id].pr_reg;
+	struct user_regs_struct *uregs = (void *)thread_prstatus->pr_reg;
 	uregs->r15 = gregs[REG_R15];
 	uregs->r14 = gregs[REG_R14];
 	uregs->r13 = gregs[REG_R13];
@@ -386,14 +402,14 @@ static void mc_persist_registers(int sig, siginfo_t *info, void *ctx) {
 	syscall(SYS_arch_prctl, ARCH_GET_FS, &(uregs->fs_base));
 	syscall(SYS_arch_prctl, ARCH_GET_GS, &(uregs->gs_base));
 
-	prstatus[thread_id].pr_pid = syscall(SYS_gettid);
+	thread_prstatus->pr_pid = syscall(SYS_gettid);
 
 	// Wait until all threads save their registers
 	pthread_barrier_wait(&mc_thread_barrier);
 
 
 	// It doesn't matter which thread writes the core file
-	if (thread_id == 0) {
+	if (thread_prstatus == &mc_prstatus.first->value) {
 		mc_save_core_file();
 	}
 
@@ -503,8 +519,8 @@ int minicriu_dump(void) {
 		return 1;
 	}
 
-	mc_thread_counter = 0;
-	int my_thread_id = -1;
+	int thread_counter = 0;
+	prstatus_t *my_prstatus = NULL;
 	DIR *tasksdir = opendir("/proc/self/task/");
 	struct dirent *taskdent;
 	while ((taskdent = readdir(tasksdir))) {
@@ -513,8 +529,9 @@ int minicriu_dump(void) {
 		}
 		int tid = atoi(taskdent->d_name);
 		debug_log("minicriu %d me %d\n", tid, mytid == tid);
+		++thread_counter;
 		if (tid == mytid) {
-			my_thread_id = mc_thread_counter++;
+			my_prstatus = APPEND_LIST(prstatus_t, &mc_prstatus);
 			continue;
 		}
 		if (mc_check_signal_blocked(taskdent->d_name)) {
@@ -522,13 +539,13 @@ int minicriu_dump(void) {
 			// TODO: revert all signals etc
 			return 1;
 		}
-		int r = mc_signal_thread(MC_CHECKPOINT_THREAD, tid, mc_thread_counter++);
+		int r = mc_signal_thread(MC_CHECKPOINT_THREAD, tid, APPEND_LIST(prstatus_t, &mc_prstatus));
 		__atomic_fetch_sub(&mc_futex_checkpoint, 1, __ATOMIC_SEQ_CST);
 	}
 	closedir(tasksdir);
 
-	assert(my_thread_id >= 0);
-	debug_log("thread_counter = %d\n", mc_thread_counter);
+	assert(my_prstatus != NULL);
+	debug_log("thread_counter = %d\n", thread_counter);
 
 	uint32_t current_count;
 	while ((current_count = mc_futex_checkpoint) != 0) {
@@ -536,7 +553,7 @@ int minicriu_dump(void) {
 	}
 
 	// Initialize barrier
-	pthread_barrier_init(&mc_thread_barrier, NULL, mc_thread_counter);
+	pthread_barrier_init(&mc_thread_barrier, NULL, thread_counter);
 
 	// Say to other threads that barrier is initialized
 	__atomic_fetch_add(&mc_barrier_initialization, 1, __ATOMIC_SEQ_CST);
@@ -547,7 +564,7 @@ int minicriu_dump(void) {
 	pid_t pid = syscall(SYS_getpid);
 
 	// Save registers
-	mc_signal_thread(MC_PERSIST_REGISTERS, syscall(SYS_gettid), my_thread_id);
+	mc_signal_thread(MC_PERSIST_REGISTERS, syscall(SYS_gettid), my_prstatus);
 
 	RESTORE_CTX(ctx);
 
@@ -575,7 +592,7 @@ int minicriu_dump(void) {
 	*	munmap segments before the threads are restored
 	*/
 
-	while ((current_count = mc_restored_threads) != mc_thread_counter - 1) {
+	while ((current_count = mc_restored_threads) != thread_counter - 1) {
 		syscall(SYS_futex, &mc_restored_threads, FUTEX_WAIT, current_count);
 	}
 
@@ -633,7 +650,7 @@ int minicriu_dump(void) {
 
 
 static void mc_checkpoint_thread(int sig, siginfo_t *info, void *ctx_unused) {
-	int thread_id = info->si_value.sival_int;
+	void *thread_prstatus = info->si_value.sival_ptr;
 	__atomic_fetch_add(&mc_futex_checkpoint, 1, __ATOMIC_SEQ_CST);
 	syscall(SYS_futex, &mc_futex_checkpoint, FUTEX_WAKE, 1);
 
@@ -668,7 +685,7 @@ static void mc_checkpoint_thread(int sig, siginfo_t *info, void *ctx_unused) {
 	}
 
 	// Save registers
-	mc_signal_thread(MC_PERSIST_REGISTERS, syscall(SYS_gettid), thread_id);
+	mc_signal_thread(MC_PERSIST_REGISTERS, syscall(SYS_gettid), thread_prstatus);
 
 	while (!mc_futex_restore) {
 		// syscall sets thread-local errno while thread-local
@@ -704,7 +721,7 @@ static void mc_checkpoint_thread(int sig, siginfo_t *info, void *ctx_unused) {
 
 static int mc_getmap() {
 	char line[512];
-	mc_mapscnt = 0;
+	INIT_LIST(mc_map, &mc_maps);
 	FILE *proc_maps;
 	proc_maps = fopen("/proc/self/maps", "r");
 
@@ -729,14 +746,9 @@ static int mc_getmap() {
 		*/
 		if (!strncmp(mapname, "[vsyscall]", 10)) continue;
 
-		if (mc_mapscnt == MC_MAX_MAPS) {
-			fclose(proc_maps);
-			perror("maps limit");
-			return 1;
-		}
-
-		maps[mc_mapscnt].start = addr_start;
-		maps[mc_mapscnt++].end = addr_end;
+		mc_map *mapping = APPEND_LIST(mc_map, &mc_maps);
+		mapping->start = addr_start;
+		mapping->end = addr_end;
 	}
 	fclose(proc_maps);
 
@@ -767,13 +779,16 @@ static int mc_cleanup() {
 	}
 	fclose(proc_maps);
 
-	munmap(0, (size_t)maps[0].start);
-	for (int i = 0; i < mc_mapscnt - 1; i++) {
-		munmap(maps[i].end, maps[i + 1].start - maps[i].end);
+	void *from = NULL;
+	FOREACH(mc_map, &mc_maps) {
+		size_t size = item->value.start - from;
+		munmap(from, size);
+		from = item->value.end;
 	}
 
-	if(maps[mc_mapscnt - 1].start < last_map_start) {
-		munmap(maps[mc_mapscnt - 1].end, last_map_end - maps[mc_mapscnt - 1].end);
+	if(mc_maps.last->value.start < last_map_start) {
+		munmap(mc_maps.last->value.end, last_map_end - mc_maps.last->value.end);
 	}
+	DESTROY_LIST(mc_map, &mc_maps);
 	return 0;
 }

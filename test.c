@@ -56,9 +56,9 @@ static void do_kill(pthread_t thr, const char *msg) {
 }
 
 void sighnd(int sig) {
-	char buf[64];
-	int len = snprintf(buf, sizeof(buf), "SIG %d\n", gettid());
-	write(STDOUT_FILENO, buf, len);
+	// char buf[64];
+	// int len = snprintf(buf, sizeof(buf), "SIG %d\n", gettid());
+	// write(STDOUT_FILENO, buf, len);
 }
 
 void *thread(void *arg) {
@@ -68,7 +68,7 @@ void *thread(void *arg) {
 	printf("tid %d\n", old);
 
 	while (1) {
-		fprintf(stderr, "THREAD old tid %d new tid %d local %d\n", old, gettid(), shared_fn());
+		// fprintf(stderr, "THREAD old tid %d new tid %d local %d\n", old, gettid(), shared_fn());
 		do_kill(main_thread, "kill main");
 		usleep(300000);
 	}
@@ -126,7 +126,7 @@ int main(int argc, char *argv[]) {
 	printf("done2\n");
 
 	while (1) {
-		printf("MAIN pid old %d new %d tid %d local %d\n", oldpid, getpid(), gettid(), shared_fn());
+		// printf("MAIN pid old %d new %d tid %d local %d\n", oldpid, getpid(), gettid(), shared_fn());
 		do_kill(other, "kill other");
 		sleep(1);
 	}

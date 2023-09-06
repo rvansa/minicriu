@@ -19,7 +19,7 @@ int core_writer_close(core_writer *w) {
 	}
 }
 
-int core_write_header(core_writer *w, const Elf64_Phdr *phdr, size_t phnum) {
+int core_write_elf_header(core_writer *w, size_t phnum) {
 	Elf64_Ehdr ehdr;
 	// Create Elf header
 	memset(&ehdr, 0, sizeof(ehdr));
@@ -41,7 +41,6 @@ int core_write_header(core_writer *w, const Elf64_Phdr *phdr, size_t phnum) {
 	ehdr.e_phnum = phnum;
 
 	MUST(core_write(w, &ehdr, sizeof(Elf64_Ehdr)));
-	MUST(core_write(w, phdr, phnum * sizeof(Elf64_Phdr)));
 	return 0;
 }
 
