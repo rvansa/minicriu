@@ -28,6 +28,7 @@
 
 #include <assert.h>
 #include <alloca.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <string.h>
 #include <stdint.h>
@@ -73,11 +74,22 @@ static void arch_prctl(int code, unsigned long addr) {
 	}
 }
 
+static int mc_signal_thread(int signum, int tid, int arg) {
+	siginfo_t info;
+	info.si_signo = signum;
+	info.si_code = SI_QUEUE;
+	info.si_value.sival_int = arg;
+	if (syscall(SYS_rt_tgsigqueueinfo, syscall(SYS_getpid), tid, signum, &info)) {
+		fprintf(stderr, "Cannot send signal %d (value %d) to thread %d: %s\n",
+			signum, arg, tid, strerror(errno));
+	}
+}
+
 static void restore(int sig, siginfo_t *info, void *ctx) {
 	ucontext_t *uc = (ucontext_t *) ctx;
 
 	greg_t *gregs = uc->uc_mcontext.gregs;
-	int thread_id = gregs[REG_RDX];
+	int thread_id = info->si_value.sival_int;
 	struct user_regs_struct *uregs = (void*)prstatus[thread_id]->pr_reg;
 
 	/*printf("restore %d fsbase %llx\n", thread_id, uregs->fs_base);*/
@@ -138,9 +150,8 @@ static unsigned long align_up(unsigned long v, unsigned p) {
 }
 
 static int clonefn(void *arg) {
-	int r = syscall(SYS_tkill, syscall(SYS_gettid), SIGSYS,
-			/* extra arg to _signal handler_ */ arg);
-	fprintf(stderr, "should not reach here (thread %d)\n", (int)(long)arg);
+	mc_signal_thread(SIGSYS, syscall(SYS_gettid), (int)(uintptr_t) arg);
+	fprintf(stderr, "should not reach here (thread %ld)\n", (uintptr_t) arg);
 	return 1;
 }
 
